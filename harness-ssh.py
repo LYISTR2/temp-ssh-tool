@@ -62,7 +62,7 @@ def revoke(name):
     m=json.loads(p.read_text())
     try: u=pwd.getpwnam(name)
     except KeyError: p.unlink();return
-    if u.pw_uid!=m['uid'] or u.pw_dir!=m['home'] or not u.pw_gecos.startswith('harness-ssh:'):
+    if u.pw_uid!=m['uid'] or u.pw_dir!=m['home'] or not u.pw_gecos.startswith('harness-ssh-'):
         raise ValueError('账号身份与记录不符，拒绝删除')
     run('usermod','--expiredate','1970-01-02','--shell','/usr/sbin/nologin',name)
     result=subprocess.run(['pkill','-KILL','-u',str(u.pw_uid)])
@@ -93,7 +93,7 @@ def install():
     for p in [APP,service,timer]:
         if p.exists() and p.resolve()!=source:shutil.copy2(p,BASE/(p.name+'.backup-'+stamp))
     if source!=APP:write(APP,source.read_text(),0o700)
-    write(service,'[Unit]\nDescription=Revoke expired harness SSH accounts\nAfter=local-fs.target\nBefore=ssh.service sshd.service\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/harness-ssh cleanup\n',0o644)
+    write(service,'[Unit]\nDescription=Revoke expired harness SSH accounts\nAfter=local-fs.target\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/harness-ssh cleanup\n',0o644)
     write(timer,'[Unit]\nDescription=Temporary SSH expiry check\n[Timer]\nOnBootSec=1s\nOnUnitActiveSec=15s\nAccuracySec=1s\nUnit=harness-ssh-cleanup.service\n[Install]\nWantedBy=timers.target\n',0o644)
     run('systemctl','daemon-reload');run('systemctl','enable','--now',timer.name)
     run('systemctl','is-active','--quiet',timer.name)
@@ -128,7 +128,7 @@ def create(args):
     # Record creation immediately after useradd; failure rolls back the new account.
     created=False
     try:
-        run('useradd','--create-home','--user-group','--shell','/bin/bash','--comment','harness-ssh:'+name,name);created=True
+        run('useradd','--create-home','--user-group','--shell','/bin/bash','--comment','harness-ssh-'+name,name);created=True
         u=pwd.getpwnam(name)
         write(meta(name),json.dumps({'uid':u.pw_uid,'home':u.pw_dir,'expires':expires,'mode':args.mode,'auth':args.auth}))
         run('usermod','--append','--groups','harness-temp',name)

@@ -10,6 +10,10 @@ class Tests(unittest.TestCase):
   enabled=a.policy_text(original,True);disabled=a.policy_text(enabled,False)
   self.assertIn(original.strip(),disabled);self.assertEqual(disabled.count(a.BEGIN),1)
   self.assertIn('PasswordAuthentication yes',enabled);self.assertNotIn('PasswordAuthentication yes',disabled)
+ def test_linux_comment_and_no_reload_order_deadlock(self):
+  source=pathlib.Path(a.__file__).read_text()
+  self.assertNotIn("'harness-ssh:'",source)
+  self.assertNotIn('Before=ssh.service sshd.service',source)
  def test_auth_cli(self):
   self.assertEqual(a.parser().parse_args(['create','1h','--auth','password']).auth,'password')
  def test_menu_returns(self):
