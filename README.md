@@ -2,6 +2,16 @@
 
 参考 LYISTR2/temp-ssh-tool 的工作流，独立 Python 实现，Bash 一键入口。适用 Debian/Ubuntu、Python3、OpenSSH、运行中的 systemd，需要 sudo/root。
 
+## 一键下载并打开交互菜单（推荐）
+
+```bash
+bash -c 'f=$(mktemp) || exit; trap '\''rm -f -- "$f"'\'' EXIT; curl -fsSL --connect-timeout 15 --max-time 120 https://raw.githubusercontent.com/LYISTR2/temp-ssh-tool/main/bootstrap.sh -o "$f" && bash "$f"'
+```
+
+自动拉取最新脚本、安装或升级，然后打开交互菜单；非 root 用户会请求 sudo。之后在任意目录输入 **`hssh`** 再次打开。
+
+命令先确认下载成功再执行，保留终端输入供交互使用（不使用 `curl | bash`）。需要已安装 curl、Python 3，以及前述系统依赖。执行的是本仓库 `main` 最新代码，请先确认信任源码；安装会修改临时账号组的 SSH 规则并启用回收定时器。
+
 ## 首次启动 / 升级
 
 从 GitHub 获取并启动：
