@@ -36,7 +36,11 @@ def password_policy(enabled):
         run('systemctl','reload',service);run('systemctl','is-active','--quiet',service)
         write(BASE/'policy.json',json.dumps({'password':enabled}))
     except Exception:
-        write(CONFIG,original,mode);run('sshd','-t');run('systemctl','reload',service);raise
+        try:
+            write(CONFIG,original,mode);run('sshd','-t');run('systemctl','reload',service)
+        except Exception as restore_error:
+            raise RuntimeError('SSH 配置应用失败，且回滚也失败，请检查 '+str(backup)) from restore_error
+        raise
     print('临时账号密码登录已'+('开启' if enabled else '关闭')+'；备份：'+str(backup))
     print('仅影响 harness-temp 组；不终止已有连接。地址相关 Match 和真实登录仍需客户端验证。')
 
