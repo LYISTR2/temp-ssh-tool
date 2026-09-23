@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Temporary SSH key accounts for Debian/Ubuntu + systemd. No sudo grants."""
+"""Temporary password SSH accounts for Debian/Ubuntu + systemd."""
 import argparse, datetime, fcntl, json, os, pathlib, pwd, re, secrets, shutil, subprocess, sys, time
 BASE=pathlib.Path('/var/lib/harness-ssh')
 APP=pathlib.Path('/usr/local/sbin/harness-ssh')
-PRESETS={'15m':900,'1h':3600,'4h':14400,'8h':28800,'24h':86400}
+PRESETS={'1h':3600,'2h':7200,'3h':10800}
 CONFIG=pathlib.Path('/etc/ssh/sshd_config')
 BEGIN='# BEGIN HARNESS-SSH MANAGED'
 END='# END HARNESS-SSH MANAGED'
@@ -12,15 +12,25 @@ def policy_text(original,enabled):
     if original.count(BEGIN)!=original.count(END) or original.count(BEGIN)>1:raise ValueError('SSH 配置管理标记异常')
     if BEGIN in original:
         original=re.sub(re.escape(BEGIN)+r'.*?'+re.escape(END)+r'\n?', '', original, flags=re.S)
-    return original.rstrip()+'\n\n'+BEGIN+'\nMatch Group harness-temp\n    PasswordAuthentication '+('yes' if enabled else 'no')+'\n    KbdInteractiveAuthentication no\n    PubkeyAuthentication yes\n    DisableForwarding yes\n    PermitTTY no\n'+END+'\n'
+    # Global directives must precede Include and Match blocks. Also removes the
+    # previous version's Match Group block without altering other SSH options.
+    policy=BEGIN+'\nPasswordAuthentication '+('yes' if enabled else 'no')+'\n'
+    if not enabled:policy+='KbdInteractiveAuthentication no\n'
+    return policy+END+'\n'+original.lstrip('\n')
+
+def effective(name=None):
+    args=['sshd','-T']
+    if name:args+=['-C',f'user={name},host=localhost,addr=127.0.0.1']
+    return dict(line.split(None,1) for line in run(*args,capture_output=True).stdout.splitlines() if ' ' in line)
 
 def verify_auth(name,enabled):
-    text=run('sshd','-T','-C',f'user={name},host=localhost,addr=127.0.0.1',capture_output=True).stdout
-    fields=dict(line.split(None,1) for line in text.splitlines() if ' ' in line)
-    expected={'passwordauthentication':'yes' if enabled else 'no','kbdinteractiveauthentication':'no','pubkeyauthentication':'yes','disableforwarding':'yes','permittty':'no'}
+    fields=effective(name)
+    expected={'passwordauthentication':'yes' if enabled else 'no'}
+    if not enabled:expected['kbdinteractiveauthentication']='no'
     if any(fields.get(k)!=v for k,v in expected.items()):raise RuntimeError('已有 Match 规则优先或策略冲突，无法应用临时账号策略')
     if enabled and fields.get('authenticationmethods','any') not in ('any','password'):
-        raise RuntimeError('AuthenticationMethods 不允许独立密码登录；保留原策略，不强行放宽')
+        raise RuntimeError('AuthenticationMethods 不允许独立密码登录；保留原策略')
+    if enabled and fields.get('permittty')=='no':raise RuntimeError('SSH 策略禁止交互式终端登录')
 
 def password_policy(enabled):
     run('sshd','-t')
@@ -32,21 +42,29 @@ def password_policy(enabled):
     backup=BASE/('sshd_config.backup-'+str(time.time_ns()));shutil.copy2(CONFIG,backup)
     try:
         write(CONFIG,policy_text(original,enabled),mode);run('sshd','-t')
+        if password_enabled()!=enabled:raise RuntimeError('已有 SSH 规则优先于服务器密码开关')
+        if not enabled and effective().get('kbdinteractiveauthentication')!='no':
+            raise RuntimeError('键盘交互认证仍然开启，拒绝关闭密码登录')
         for f in BASE.glob('hs_*.json'):verify_auth(f.stem,enabled)
         run('systemctl','reload',service);run('systemctl','is-active','--quiet',service)
-        write(BASE/'policy.json',json.dumps({'password':enabled}))
     except Exception:
         try:
             write(CONFIG,original,mode);run('sshd','-t');run('systemctl','reload',service)
         except Exception as restore_error:
             raise RuntimeError('SSH 配置应用失败，且回滚也失败，请检查 '+str(backup)) from restore_error
         raise
-    print('临时账号密码登录已'+('开启' if enabled else '关闭')+'；备份：'+str(backup))
-    print('仅影响 harness-temp 组；不终止已有连接。地址相关 Match 和真实登录仍需客户端验证。')
+    print('服务器 SSH 密码登录已'+('开启' if enabled else '关闭')+'；备份：'+str(backup))
+    print('root 仍受 PermitRootLogin 等规则限制；已有连接不会断开。')
 
 def password_enabled():
-    p=BASE/'policy.json'
-    return p.exists() and json.loads(p.read_text()).get('password',False)
+    return effective().get('passwordauthentication')=='yes'
+
+def duration_seconds(value):
+    match=re.fullmatch(r'([1-9][0-9]*)([mhd])',value)
+    if not match:raise ValueError('有效期格式：1h、2h、3h，或 90m、4h、2d')
+    seconds=int(match[1])*{'m':60,'h':3600,'d':86400}[match[2]]
+    if not 60<=seconds<=30*86400:raise ValueError('有效期范围：1 分钟至 30 天')
+    return seconds
 
 def run(*args,**kw):
     return subprocess.run(args,check=True,text=True,**kw)
@@ -86,7 +104,7 @@ def cleanup():
         except Exception as e:failed=True;print(str(e),file=sys.stderr)
     if failed:raise RuntimeError('部分到期账号清理失败，下一轮重试；请检查 journalctl -u harness-ssh-cleanup')
 def install():
-    for tool in ['systemctl','useradd','usermod','userdel','ssh-keygen','sshd','pkill','chpasswd']:
+    for tool in ['systemctl','useradd','usermod','userdel','sshd','pkill','chpasswd']:
         if not shutil.which(tool):raise RuntimeError('缺少依赖: '+tool)
     if not pathlib.Path('/run/systemd/system').exists():raise RuntimeError('需要正在运行的 systemd')
     run('sshd','-t')
@@ -105,7 +123,11 @@ def install():
     shortcut=pathlib.Path('/usr/local/bin/hssh')
     if shortcut.exists():shutil.copy2(shortcut,BASE/('hssh.backup-'+stamp))
     write(shortcut,'#!/bin/sh\nif [ "$(id -u)" -ne 0 ]; then exec sudo /usr/local/sbin/harness-ssh "$@"; fi\nexec /usr/local/sbin/harness-ssh "$@"\n',0o755)
-    password_policy(password_enabled())
+    # On upgrade, remove the old group-specific Match block while preserving
+    # the server's current global password authentication setting.
+    current=CONFIG.read_text()
+    if BEGIN in current and 'Match Group harness-temp' in current:
+        password_policy(password_enabled())
     cleanup();print('安装完成，再次启动输入：hssh')
 def create(args):
     if not APP.exists():raise RuntimeError('请先运行 install')
@@ -115,34 +137,19 @@ def create(args):
     except KeyError:pass
     else:raise ValueError('同名账号已存在；拒绝覆盖')
     if meta(name).exists():raise ValueError('已有同名管理记录；请先检查或撤销')
-    keydir=None
-    if args.auth=='password':
-        if args.pubkey:raise ValueError('密码模式不能同时传入公钥')
-        if not password_enabled():raise ValueError('请先在菜单开启临时账号密码登录')
-        public=None
-    elif args.pubkey:
-        public=pathlib.Path(args.pubkey).read_text().strip()
-        if '\n' in public or not re.match(r'^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)) [A-Za-z0-9+/=]+(?: .*)?$',public):raise ValueError('请提供单行 OpenSSH 公钥，不能是私钥或 authorized_keys 选项')
-        run('ssh-keygen','-l','-f',str(pathlib.Path(args.pubkey).resolve()),stdout=subprocess.DEVNULL)
-    else:
-        keydir=BASE/('key-'+name);keydir.mkdir(mode=0o700)
-        run('ssh-keygen','-q','-t','ed25519','-N','','-C',name,'-f',str(keydir/'id_ed25519'))
-        public=(keydir/'id_ed25519.pub').read_text().strip()
-    expires=int(time.time())+PRESETS[args.mode]
+    if not password_enabled():raise ValueError('服务器密码登录已关闭，请先在菜单开启')
+    seconds=duration_seconds(args.duration)
     # Record creation immediately after useradd; failure rolls back the new account.
     created=False
     try:
         run('useradd','--create-home','--user-group','--shell','/bin/bash','--comment','harness-ssh-'+name,name);created=True
         u=pwd.getpwnam(name)
-        write(meta(name),json.dumps({'uid':u.pw_uid,'home':u.pw_dir,'expires':expires,'mode':args.mode,'auth':args.auth}))
+        expires=int(time.time())+seconds
+        write(meta(name),json.dumps({'uid':u.pw_uid,'home':u.pw_dir,'expires':expires,'duration':args.duration,'auth':'password'}))
         run('usermod','--append','--groups','harness-temp',name)
-        verify_auth(name,password_enabled())
+        verify_auth(name,True)
         password=secrets.token_urlsafe(24)
         run('chpasswd',input=name+':'+password+'\n',stdout=subprocess.DEVNULL)
-        if public:
-            ssh=pathlib.Path(u.pw_dir)/'.ssh';ssh.mkdir(mode=0o700)
-            write(ssh/'authorized_keys','restrict '+public+'\n')
-            for p in [ssh,ssh/'authorized_keys']:os.chown(p,u.pw_uid,u.pw_gid)
         # Day-granularity backstop; timer is responsible for sub-day deadlines.
         day=datetime.datetime.fromtimestamp(expires,datetime.timezone.utc).date()+datetime.timedelta(days=1)
         run('usermod','--expiredate',str(day),name)
@@ -150,62 +157,73 @@ def create(args):
         if created:
             if meta(name).exists():revoke(name)
             else:run('userdel','--remove',name)
-        if keydir:shutil.rmtree(keydir)
         raise
-    keyinfo=str(keydir/'id_ed25519') if keydir else ('使用所提供公钥对应的私钥' if args.auth=='key' else None)
-    options='-i <私钥路径>' if args.auth=='key' else '-o PreferredAuthentications=password -o PubkeyAuthentication=no'
-    if args.auth=='password':print('临时密码（只显示一次，不写元数据）:',password)
-    print(json.dumps({'auth':args.auth,'username':name,'host':args.host or '填写服务器可达IP或域名','port':args.port,'expires_utc':datetime.datetime.fromtimestamp(expires,datetime.timezone.utc).isoformat(),'private_key_file':keyinfo,'ssh_command':f'ssh -T -p {args.port} {options} {name}@{args.host or "<服务器地址>"}','permissions':'普通用户，无 sudo；禁止 PTY/端口转发/agent 转发；允许非交互命令','revoke':f'sudo harness-ssh revoke {name}'},ensure_ascii=False,indent=2))
-    print('注意：尚未验证远程 SSH 登录。防火墙、AllowUsers/Match/认证策略可能阻止连接；请从 harness 端测试。')
+    host=args.host or '<服务器IP或域名>'
+    print('\n临时 SSH 登录信息（密码只显示一次）')
+    print('地址：'+host+':'+str(args.port))
+    print('账号：'+name)
+    print('密码：'+password)
+    print('到期：'+datetime.datetime.fromtimestamp(expires,datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'))
+    print('登录：ssh -p '+str(args.port)+' '+name+'@'+host)
+    print('提前撤销：hssh revoke '+name)
+    print('普通用户，无 sudo。请从另一终端验证新连接。')
+
+def list_accounts():
+    records=sorted(BASE.glob('hs_*.json'))
+    if not records:print('暂无临时账号')
+    for record in records:
+        info=json.loads(record.read_text())
+        expiry=datetime.datetime.fromtimestamp(info['expires'],datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        print(record.stem+'  到期 '+expiry+('  已到期，待清理' if info['expires']<=time.time() else ''))
 
 def parser():
     p=argparse.ArgumentParser(description=__doc__);s=p.add_subparsers(dest='action')
     for a in ['install','list','cleanup']:s.add_parser(a)
     r=s.add_parser('revoke');r.add_argument('name')
     q=s.add_parser('password');q.add_argument('state',choices=['on','off'])
-    c=s.add_parser('create');c.add_argument('mode',choices=PRESETS);c.add_argument('--auth',choices=['key','password'],default='key');c.add_argument('--name');c.add_argument('--pubkey');c.add_argument('--host');c.add_argument('--port',type=int,default=22)
+    c=s.add_parser('create');c.add_argument('duration',help='1h、2h、3h 或自定义 90m/4h/2d');c.add_argument('--name');c.add_argument('--host');c.add_argument('--port',type=int,default=22)
     return p
 
 def menu(p):
     while True:
-        print('\n=== Harness SSH v2 · 再次启动：hssh ===\n1 创建临时账号\n2 查看账号\n3 撤销账号\n4 开启临时账号密码登录\n5 关闭临时账号密码登录\n6 安装/修复\n0 退出')
+        print('\n=== 临时 SSH 管理 ===\n1 生成临时密码登录信息\n2 开关服务器 SSH 密码登录（当前：'+('开' if password_enabled() else '关')+'）\n3 查看 / 提前撤销临时账号\n0 退出')
         try:
             choice=input('选择: ').strip()
             if choice=='0':return
             if choice=='1':
-                auth=input('认证方式 1=密钥 / 2=随机密码 [1]: ').strip() or '1'
-                if auth not in ('1','2'):raise ValueError('无效认证方式')
-                mode=input('时长 1=15分钟 2=1小时 3=4小时 4=8小时 5=24小时 [2]: ').strip() or '2'
-                if mode not in ('1','2','3','4','5'):raise ValueError('无效时长')
-                host=input('服务器可达 IP/域名: ').strip();port=input('SSH 端口 [22]: ').strip() or '22'
+                if not password_enabled():
+                    if input('密码登录已关闭，输入 yes 开启后继续: ').strip()!='yes':continue
+                    subprocess.run([sys.executable,str(APP),'password','on'],check=True)
+                duration=input('时长 1=1小时 2=2小时 3=3小时 4=自定义 [1]: ').strip() or '1'
+                if duration=='4':duration=input('输入时长（例如 90m / 4h / 2d）: ').strip()
+                else:duration={'1':'1h','2':'2h','3':'3h'}.get(duration,'')
+                duration_seconds(duration)
+                host=input('服务器 IP/域名（回车稍后填写）: ').strip();port=input('SSH 端口 [22]: ').strip() or '22'
                 if not port.isdigit() or not 1<=int(port)<=65535:raise ValueError('无效端口')
-                argv=['create',list(PRESETS)[int(mode)-1],'--auth','key' if auth=='1' else 'password','--host',host,'--port',port]
-                if auth=='1':
-                    key=input('公钥文件路径（留空生成临时密钥）: ').strip()
-                    if key:argv+=['--pubkey',key]
-                elif not password_enabled():
-                    if input('密码登录未开启，是否仅为临时账号组开启？输入 yes: ').strip()!='yes':continue
-                    if subprocess.run([sys.executable,str(APP),'password','on']).returncode:continue
-            elif choice=='2':argv=['list']
+                argv=['create',duration,'--port',port]
+                if host:argv+=['--host',host]
+            elif choice=='2':
+                target='off' if password_enabled() else 'on'
+                if input('将'+('关闭' if target=='off' else '开启')+'服务器 SSH 密码登录，输入 yes 确认: ').strip()!='yes':continue
+                argv=['password',target]
             elif choice=='3':
-                name=valid_name(input('撤销账号名: ').strip())
-                if input('将杀会话并删除家目录，输入 yes 确认: ').strip()!='yes':continue
+                subprocess.run([sys.executable,str(APP),'list'],check=True)
+                name=input('输入账号名提前撤销，回车返回: ').strip()
+                if not name:continue
+                valid_name(name)
+                if input('将断开连接并删除账号，输入 yes 确认: ').strip()!='yes':continue
                 argv=['revoke',name]
-            elif choice in ('4','5'):
-                if input('仅影响临时账号组，不断开已有会话。输入 yes 确认: ').strip()!='yes':continue
-                argv=['password','on' if choice=='4' else 'off']
-            elif choice=='6':argv=['install']
             else:raise ValueError('无效选项')
             # Run each operation separately: never hold the cleanup lock while waiting for input.
-            subprocess.run([sys.executable,str(pathlib.Path(__file__).resolve()),*argv])
+            subprocess.run([sys.executable,str(pathlib.Path(__file__).resolve()),*argv],check=True)
         except (EOFError,KeyboardInterrupt):print('\n退出');return
         except Exception as e:print('错误:',e)
 
 def main():
     p=parser();args=p.parse_args()
-    if not args.action:return menu(p)
     if os.geteuid()!=0:raise PermissionError('请使用 sudo 或 root 运行')
     os.umask(0o077);BASE.mkdir(mode=0o700,parents=True,exist_ok=True)
+    if not args.action:return menu(p)
     with open(BASE/'.lock','w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         if args.action=='install':install()
@@ -215,8 +233,7 @@ def main():
         elif args.action=='revoke':revoke(args.name)
         elif args.action=='cleanup':cleanup()
         elif args.action=='password':password_policy(args.state=='on')
-        else:
-            for f in sorted(BASE.glob('hs_*.json')):print(f.stem,f.read_text())
+        else:list_accounts()
 if __name__=='__main__':
     try:main()
     except Exception as e:print('错误:',e,file=sys.stderr);sys.exit(1)
