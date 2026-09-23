@@ -5,6 +5,7 @@ BASE=pathlib.Path('/var/lib/harness-ssh')
 APP=pathlib.Path('/usr/local/sbin/harness-ssh')
 PRESETS={'1h':3600,'2h':7200,'3h':10800}
 CONFIG=pathlib.Path('/etc/ssh/sshd_config')
+SUDOERS_DIR=pathlib.Path('/etc/sudoers.d')
 BEGIN='# BEGIN HARNESS-SSH MANAGED'
 END='# END HARNESS-SSH MANAGED'
 
@@ -89,15 +90,32 @@ def write(path,text,mode=0o600):
         os.chmod(tmp,mode);f.write(text);f.flush();os.fsync(f.fileno())
     os.replace(tmp,path)
 def meta(name): return BASE/(valid_name(name)+'.json')
+def sudoers_path(name): return SUDOERS_DIR/('harness-ssh-'+valid_name(name))
+def grant_sudo(name):
+    path=sudoers_path(name)
+    if path.exists():raise ValueError('sudoers 规则已存在，拒绝覆盖: '+str(path))
+    if not shutil.which('visudo'):raise RuntimeError('缺少 visudo，无法创建高权限账号')
+    # Explicit user-only rule, authenticated sudo; no NOPASSWD and no system sudo group.
+    write(path, f'{name} ALL=(ALL:ALL) ALL\n', 0o440)
+    try:run('visudo','-cf',str(path),stdout=subprocess.DEVNULL)
+    except Exception:
+        path.unlink()
+        raise
+
 def revoke(name):
     p=meta(name)
     if not p.exists(): raise ValueError('不是本工具管理的账号；拒绝删除')
     m=json.loads(p.read_text())
+    rule=sudoers_path(name)
     try: u=pwd.getpwnam(name)
-    except KeyError: p.unlink();return
+    except KeyError:
+        if rule.exists():rule.unlink()
+        p.unlink();return
     if u.pw_uid!=m['uid'] or u.pw_dir!=m['home'] or not u.pw_gecos.startswith('harness-ssh-'):
         raise ValueError('账号身份与记录不符，拒绝删除')
     run('usermod','--expiredate','1970-01-02','--shell','/usr/sbin/nologin',name)
+    # Drop sudo immediately, even if terminating processes or userdel later fails.
+    if rule.exists():rule.unlink()
     result=subprocess.run(['pkill','-KILL','-u',str(u.pw_uid)])
     if result.returncode not in (0,1):raise RuntimeError('终止账号进程失败')
     time.sleep(.15)
@@ -149,6 +167,8 @@ def create(args):
     else:raise ValueError('同名账号已存在；拒绝覆盖')
     if meta(name).exists():raise ValueError('已有同名管理记录；请先检查或撤销')
     if not password_enabled():raise ValueError('服务器密码登录已关闭，请先在菜单开启')
+    if args.role=='sudo' and not shutil.which('visudo'):
+        raise RuntimeError('缺少 sudo/visudo，无法创建高权限账号')
     host=args.host or detect_public_ip()
     seconds=duration_seconds(args.duration)
     # Record creation immediately after useradd; failure rolls back the new account.
@@ -157,7 +177,7 @@ def create(args):
         run('useradd','--create-home','--user-group','--shell','/bin/bash','--comment','harness-ssh-'+name,name);created=True
         u=pwd.getpwnam(name)
         expires=int(time.time())+seconds
-        write(meta(name),json.dumps({'uid':u.pw_uid,'home':u.pw_dir,'expires':expires,'duration':args.duration,'auth':'password'}))
+        write(meta(name),json.dumps({'uid':u.pw_uid,'home':u.pw_dir,'expires':expires,'duration':args.duration,'auth':'password','role':args.role}))
         run('usermod','--append','--groups','harness-temp',name)
         verify_auth(name,True)
         password=secrets.token_urlsafe(24)
@@ -165,6 +185,7 @@ def create(args):
         # Day-granularity backstop; timer is responsible for sub-day deadlines.
         day=datetime.datetime.fromtimestamp(expires,datetime.timezone.utc).date()+datetime.timedelta(days=1)
         run('usermod','--expiredate',str(day),name)
+        if args.role=='sudo':grant_sudo(name)
     except Exception:
         if created:
             if meta(name).exists():revoke(name)
@@ -177,7 +198,7 @@ def create(args):
     print('到期：'+datetime.datetime.fromtimestamp(expires,datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'))
     print('登录：ssh -p '+str(args.port)+' '+name+'@'+host)
     print('提前撤销：hssh revoke '+name)
-    print('普通用户，无 sudo。请从另一终端验证新连接。')
+    print(('高权限用户，可使用 sudo（需输入该账号密码）。' if args.role=='sudo' else '普通用户，无 sudo。')+'请从另一终端验证新连接。')
 
 def list_accounts():
     records=sorted(BASE.glob('hs_*.json'))
@@ -185,14 +206,14 @@ def list_accounts():
     for record in records:
         info=json.loads(record.read_text())
         expiry=datetime.datetime.fromtimestamp(info['expires'],datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        print(record.stem+'  到期 '+expiry+('  已到期，待清理' if info['expires']<=time.time() else ''))
+        print(record.stem+'  '+('高权限 sudo' if info.get('role')=='sudo' else '普通用户')+'  到期 '+expiry+('  已到期，待清理' if info['expires']<=time.time() else ''))
 
 def parser():
     p=argparse.ArgumentParser(description=__doc__);s=p.add_subparsers(dest='action')
     for a in ['install','list','cleanup']:s.add_parser(a)
     r=s.add_parser('revoke');r.add_argument('name')
     q=s.add_parser('password');q.add_argument('state',choices=['on','off'])
-    c=s.add_parser('create');c.add_argument('duration',help='1h、2h、3h 或自定义 90m/4h/2d');c.add_argument('--name');c.add_argument('--host');c.add_argument('--port',type=int,default=22)
+    c=s.add_parser('create');c.add_argument('duration',help='1h、2h、3h 或自定义 90m/4h/2d');c.add_argument('--name');c.add_argument('--host');c.add_argument('--port',type=int,default=22);c.add_argument('--role',choices=['normal','sudo'],default='normal')
     return p
 
 def menu(p):
@@ -209,7 +230,10 @@ def menu(p):
                 if duration=='4':duration=input('输入时长（例如 90m / 4h / 2d）: ').strip()
                 else:duration={'1':'1h','2':'2h','3':'3h'}.get(duration,'')
                 duration_seconds(duration)
-                argv=['create',duration]
+                role=input('账号权限 1=普通用户（默认） 2=高权限 sudo: ').strip() or '1'
+                if role not in ('1','2'):raise ValueError('无效账号权限选项')
+                if role=='2' and input('高权限账号可通过 sudo 管理整台服务器，输入 yes 确认: ').strip()!='yes':continue
+                argv=['create',duration,'--role','sudo' if role=='2' else 'normal']
             elif choice=='2':
                 target='off' if password_enabled() else 'on'
                 if input('将'+('关闭' if target=='off' else '开启')+'服务器 SSH 密码登录，输入 yes 确认: ').strip()!='yes':continue

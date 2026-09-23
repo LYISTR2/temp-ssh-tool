@@ -51,6 +51,8 @@ class Tests(unittest.TestCase):
         self.assertEqual(parsed.duration, '2h')
         self.assertIsNone(parsed.host)
         self.assertEqual(parsed.port, 22)
+        self.assertEqual(parsed.role, 'normal')
+        self.assertEqual(a.parser().parse_args(['create', '1h', '--role', 'sudo']).role, 'sudo')
         self.assertFalse(hasattr(parsed, 'auth'))
 
     def test_detect_public_ip(self):
@@ -66,11 +68,23 @@ class Tests(unittest.TestCase):
 
     def test_menu_create_does_not_ask_for_host_or_port(self):
         with mock.patch.object(a, 'password_enabled', return_value=True), \
-                mock.patch('builtins.input', side_effect=['1', '', '0']) as ask, \
+                mock.patch('builtins.input', side_effect=['1', '', '', '0']) as ask, \
                 mock.patch.object(a.subprocess, 'run') as run:
             a.menu(a.parser())
-            self.assertEqual(ask.call_count, 3)
-            self.assertEqual(run.call_args.args[0][-2:], ['create', '1h'])
+            self.assertEqual(ask.call_count, 4)
+            self.assertEqual(run.call_args.args[0][-4:], ['create', '1h', '--role', 'normal'])
+
+    def test_menu_sudo_requires_confirmation(self):
+        with mock.patch.object(a, 'password_enabled', return_value=True), \
+                mock.patch('builtins.input', side_effect=['1', '', '2', 'no', '0']), \
+                mock.patch.object(a.subprocess, 'run') as run:
+            a.menu(a.parser())
+            run.assert_not_called()
+        with mock.patch.object(a, 'password_enabled', return_value=True), \
+                mock.patch('builtins.input', side_effect=['1', '', '2', 'yes', '0']), \
+                mock.patch.object(a.subprocess, 'run') as run:
+            a.menu(a.parser())
+            self.assertEqual(run.call_args.args[0][-4:], ['create', '1h', '--role', 'sudo'])
 
     def test_menu_account_list_and_return(self):
         with mock.patch.object(a, 'password_enabled', return_value=False), \
@@ -105,7 +119,9 @@ class Tests(unittest.TestCase):
                 a.create(args)
             record = json.loads(a.meta('hs_abcdef').read_text())
             self.assertEqual(record['expires'], 1_800_007_200)
+            self.assertEqual(record['role'], 'normal')
             self.assertIn('密码：', output.getvalue())
+            self.assertIn('普通用户，无 sudo', output.getvalue())
             self.assertIn('ssh -p 22 hs_abcdef@example.com', output.getvalue())
 
     def test_create_auto_detects_address(self):
@@ -138,6 +154,61 @@ class Tests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 a.create(args)
             run.assert_called_once()
+
+    def test_create_sudo_grants_only_selected_account(self):
+        args = a.parser().parse_args(['create', '1h', '--role', 'sudo', '--name', 'hs_abcdef', '--host', 'example.com'])
+        user = types.SimpleNamespace(pw_uid=1234, pw_dir='/home/hs_abcdef')
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(a, 'BASE', pathlib.Path(directory)), \
+                mock.patch.object(a, 'APP', types.SimpleNamespace(exists=lambda: True)), \
+                mock.patch.object(a.shutil, 'which', return_value='/usr/sbin/visudo'), \
+                mock.patch.object(a, 'run'), \
+                mock.patch.object(a, 'grant_sudo') as grant, \
+                mock.patch.object(a.pwd, 'getpwnam', side_effect=[KeyError(), user]), \
+                mock.patch.object(a, 'password_enabled', return_value=True), \
+                mock.patch.object(a, 'effective', return_value={'passwordauthentication': 'yes', 'permittty': 'yes'}):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                a.create(args)
+            grant.assert_called_once_with('hs_abcdef')
+            self.assertEqual(json.loads(a.meta('hs_abcdef').read_text())['role'], 'sudo')
+            self.assertIn('sudo（需输入该账号密码）', output.getvalue())
+
+    def test_grant_sudo_rule_is_password_protected(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(a, 'SUDOERS_DIR', pathlib.Path(directory)), \
+                mock.patch.object(a.shutil, 'which', return_value='/usr/sbin/visudo'), \
+                mock.patch.object(a, 'run') as run:
+            a.grant_sudo('hs_abcdef')
+            rule = a.sudoers_path('hs_abcdef')
+            self.assertEqual(rule.read_text(), 'hs_abcdef ALL=(ALL:ALL) ALL\n')
+            self.assertEqual(rule.stat().st_mode & 0o777, 0o440)
+            run.assert_called_once_with('visudo', '-cf', str(rule), stdout=a.subprocess.DEVNULL)
+            with self.assertRaises(ValueError):
+                a.grant_sudo('hs_abcdef')
+
+    def test_grant_sudo_invalid_rule_is_removed(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(a, 'SUDOERS_DIR', pathlib.Path(directory)), \
+                mock.patch.object(a.shutil, 'which', return_value='/usr/sbin/visudo'), \
+                mock.patch.object(a, 'run', side_effect=RuntimeError('invalid')):
+            with self.assertRaises(RuntimeError):
+                a.grant_sudo('hs_abcdef')
+            self.assertFalse(a.sudoers_path('hs_abcdef').exists())
+
+    def test_revoke_removes_sudo_rule(self):
+        user = types.SimpleNamespace(pw_uid=1234, pw_dir='/home/hs_abcdef', pw_gecos='harness-ssh-hs_abcdef')
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(a, 'BASE', pathlib.Path(directory)), \
+                mock.patch.object(a, 'SUDOERS_DIR', pathlib.Path(directory)), \
+                mock.patch.object(a, 'run'), \
+                mock.patch.object(a.subprocess, 'run', return_value=types.SimpleNamespace(returncode=1)), \
+                mock.patch.object(a.pwd, 'getpwnam', return_value=user):
+            a.meta('hs_abcdef').write_text(json.dumps({'uid': 1234, 'home': '/home/hs_abcdef'}))
+            a.sudoers_path('hs_abcdef').write_text('hs_abcdef ALL=(ALL:ALL) ALL\n')
+            a.revoke('hs_abcdef')
+            self.assertFalse(a.sudoers_path('hs_abcdef').exists())
+            self.assertFalse(a.meta('hs_abcdef').exists())
 
     def test_identity_mismatch_rejects_delete(self):
         with tempfile.TemporaryDirectory() as directory, \
