@@ -47,9 +47,30 @@ class Tests(unittest.TestCase):
         self.assertEqual(a.valid_name('hs_abcdef'), 'hs_abcdef')
 
     def test_cli_defaults_to_password(self):
-        parsed = a.parser().parse_args(['create', '2h', '--host', 'example.com'])
+        parsed = a.parser().parse_args(['create', '2h'])
         self.assertEqual(parsed.duration, '2h')
+        self.assertIsNone(parsed.host)
+        self.assertEqual(parsed.port, 22)
         self.assertFalse(hasattr(parsed, 'auth'))
+
+    def test_detect_public_ip(self):
+        with mock.patch.object(a, 'run', return_value=types.SimpleNamespace(stdout='[{"dst":"1.1.1.1","prefsrc":"160.236.110.78"}]')) as run:
+            self.assertEqual(a.detect_public_ip(), '160.236.110.78')
+            run.assert_called_once_with('ip', '-j', '-4', 'route', 'get', '1.1.1.1', capture_output=True)
+        with mock.patch.object(a, 'run', return_value=types.SimpleNamespace(stdout='[{"src":"10.0.0.1"}]')):
+            with self.assertRaisesRegex(RuntimeError, 'NAT'):
+                a.detect_public_ip()
+        with mock.patch.object(a, 'run', return_value=types.SimpleNamespace(stdout='[]')):
+            with self.assertRaisesRegex(RuntimeError, '--host'):
+                a.detect_public_ip()
+
+    def test_menu_create_does_not_ask_for_host_or_port(self):
+        with mock.patch.object(a, 'password_enabled', return_value=True), \
+                mock.patch('builtins.input', side_effect=['1', '', '0']) as ask, \
+                mock.patch.object(a.subprocess, 'run') as run:
+            a.menu(a.parser())
+            self.assertEqual(ask.call_count, 3)
+            self.assertEqual(run.call_args.args[0][-2:], ['create', '1h'])
 
     def test_menu_account_list_and_return(self):
         with mock.patch.object(a, 'password_enabled', return_value=False), \
@@ -86,6 +107,37 @@ class Tests(unittest.TestCase):
             self.assertEqual(record['expires'], 1_800_007_200)
             self.assertIn('密码：', output.getvalue())
             self.assertIn('ssh -p 22 hs_abcdef@example.com', output.getvalue())
+
+    def test_create_auto_detects_address(self):
+        args = a.parser().parse_args(['create', '2h', '--name', 'hs_abcdef'])
+        user = types.SimpleNamespace(pw_uid=1234, pw_dir='/home/hs_abcdef')
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(a, 'BASE', pathlib.Path(directory)), \
+                mock.patch.object(a, 'APP', types.SimpleNamespace(exists=lambda: True)), \
+                mock.patch.object(a, 'detect_public_ip', return_value='160.236.110.78') as detect, \
+                mock.patch.object(a, 'run'), \
+                mock.patch.object(a.pwd, 'getpwnam', side_effect=[KeyError(), user]), \
+                mock.patch.object(a, 'password_enabled', return_value=True), \
+                mock.patch.object(a, 'effective', return_value={'passwordauthentication': 'yes', 'permittty': 'yes'}), \
+                mock.patch.object(a.time, 'time', return_value=1_800_000_000):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                a.create(args)
+            detect.assert_called_once_with()
+            self.assertIn('ssh -p 22 hs_abcdef@160.236.110.78', output.getvalue())
+
+    def test_detect_failure_does_not_create_account(self):
+        args = a.parser().parse_args(['create', '1h', '--name', 'hs_abcdef'])
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(a, 'BASE', pathlib.Path(directory)), \
+                mock.patch.object(a, 'APP', types.SimpleNamespace(exists=lambda: True)), \
+                mock.patch.object(a.pwd, 'getpwnam', side_effect=KeyError()), \
+                mock.patch.object(a, 'password_enabled', return_value=True), \
+                mock.patch.object(a, 'detect_public_ip', side_effect=RuntimeError('no public IP')), \
+                mock.patch.object(a, 'run') as run:
+            with self.assertRaises(RuntimeError):
+                a.create(args)
+            run.assert_called_once()
 
     def test_identity_mismatch_rejects_delete(self):
         with tempfile.TemporaryDirectory() as directory, \

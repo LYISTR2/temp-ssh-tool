@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Temporary password SSH accounts for Debian/Ubuntu + systemd."""
-import argparse, datetime, fcntl, json, os, pathlib, pwd, re, secrets, shutil, subprocess, sys, time
+import argparse, datetime, fcntl, ipaddress, json, os, pathlib, pwd, re, secrets, shutil, subprocess, sys, time
 BASE=pathlib.Path('/var/lib/harness-ssh')
 APP=pathlib.Path('/usr/local/sbin/harness-ssh')
 PRESETS={'1h':3600,'2h':7200,'3h':10800}
@@ -59,6 +59,17 @@ def password_policy(enabled):
 def password_enabled():
     return effective().get('passwordauthentication')=='yes'
 
+def detect_public_ip():
+    """Use the kernel's outbound IPv4 route; never guess a NAT or proxy address."""
+    result=run('ip','-j','-4','route','get','1.1.1.1',capture_output=True).stdout
+    routes=json.loads(result)
+    if not routes or not (routes[0].get('prefsrc') or routes[0].get('src')):
+        raise RuntimeError('无法识别服务器出口 IP；请用 --host 指定实际可连接地址')
+    address=routes[0].get('prefsrc') or routes[0].get('src')
+    if not ipaddress.ip_address(address).is_global:
+        raise RuntimeError('出口 IP 不是公网地址（可能位于 NAT 后）；请用 --host 指定实际可连接地址')
+    return address
+
 def duration_seconds(value):
     match=re.fullmatch(r'([1-9][0-9]*)([mhd])',value)
     if not match:raise ValueError('有效期格式：1h、2h、3h，或 90m、4h、2d')
@@ -104,7 +115,7 @@ def cleanup():
         except Exception as e:failed=True;print(str(e),file=sys.stderr)
     if failed:raise RuntimeError('部分到期账号清理失败，下一轮重试；请检查 journalctl -u harness-ssh-cleanup')
 def install():
-    for tool in ['systemctl','useradd','usermod','userdel','sshd','pkill','chpasswd']:
+    for tool in ['systemctl','useradd','usermod','userdel','sshd','pkill','chpasswd','ip']:
         if not shutil.which(tool):raise RuntimeError('缺少依赖: '+tool)
     if not pathlib.Path('/run/systemd/system').exists():raise RuntimeError('需要正在运行的 systemd')
     run('sshd','-t')
@@ -138,6 +149,7 @@ def create(args):
     else:raise ValueError('同名账号已存在；拒绝覆盖')
     if meta(name).exists():raise ValueError('已有同名管理记录；请先检查或撤销')
     if not password_enabled():raise ValueError('服务器密码登录已关闭，请先在菜单开启')
+    host=args.host or detect_public_ip()
     seconds=duration_seconds(args.duration)
     # Record creation immediately after useradd; failure rolls back the new account.
     created=False
@@ -158,7 +170,6 @@ def create(args):
             if meta(name).exists():revoke(name)
             else:run('userdel','--remove',name)
         raise
-    host=args.host or '<服务器IP或域名>'
     print('\n临时 SSH 登录信息（密码只显示一次）')
     print('地址：'+host+':'+str(args.port))
     print('账号：'+name)
@@ -198,10 +209,7 @@ def menu(p):
                 if duration=='4':duration=input('输入时长（例如 90m / 4h / 2d）: ').strip()
                 else:duration={'1':'1h','2':'2h','3':'3h'}.get(duration,'')
                 duration_seconds(duration)
-                host=input('服务器 IP/域名（回车稍后填写）: ').strip();port=input('SSH 端口 [22]: ').strip() or '22'
-                if not port.isdigit() or not 1<=int(port)<=65535:raise ValueError('无效端口')
-                argv=['create',duration,'--port',port]
-                if host:argv+=['--host',host]
+                argv=['create',duration]
             elif choice=='2':
                 target='off' if password_enabled() else 'on'
                 if input('将'+('关闭' if target=='off' else '开启')+'服务器 SSH 密码登录，输入 yes 确认: ').strip()!='yes':continue

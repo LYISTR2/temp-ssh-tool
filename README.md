@@ -1,6 +1,6 @@
 # TempSSH · 临时 SSH 密码账号
 
-一键生成限时账号及随机密码，按需开关**服务器的 SSH 密码认证**。适用于 Debian 12/13、Ubuntu 22.04/24.04，依赖 Python 3、OpenSSH、systemd、curl；需要 root 或 sudo。账号是普通用户，无 sudo 权限。
+一键生成限时账号及随机密码，按需开关**服务器的 SSH 密码认证**。适用于 Debian 12/13、Ubuntu 22.04/24.04，依赖 Python 3、OpenSSH、systemd、curl、iproute2；需要 root 或 sudo。账号是普通用户，无 sudo 权限。
 
 ## 一键安装 / 打开菜单
 
@@ -12,7 +12,7 @@ bash -c 'f=$(mktemp) || exit; trap '\''rm -f -- "$f"'\'' EXIT; curl -fsSL --conn
 
 菜单只有三个入口：
 
-1. 生成临时密码登录信息：选择 1、2、3 小时或自定义时长，填写地址和 SSH 端口；显示账号、密码、到期 UTC 时间和登录命令。密码只显示一次。
+1. 生成临时密码登录信息：选择 1、2、3 小时或自定义时长；自动识别服务器公网 IPv4，默认 SSH 端口 22，显示账号、密码、到期 UTC 时间和登录命令。密码只显示一次。
 2. 开关服务器 SSH 密码登录：修改 `sshd_config` 的全局 `PasswordAuthentication`；关闭时也关闭 `KbdInteractiveAuthentication`，避免绕过密码开关。
 3. 查看 / 提前撤销账号：撤销时终止该账号的进程并删除家目录。
 
@@ -20,14 +20,16 @@ bash -c 'f=$(mktemp) || exit; trap '\''rm -f -- "$f"'\'' EXIT; curl -fsSL --conn
 
 ```bash
 hssh password on
-hssh create 2h --host 203.0.113.10 --port 22
-hssh create 90m --host example.com
+hssh create 2h
+hssh create 90m
+# NAT、反向代理或非标准 SSH 端口时显式覆盖显示地址：
+hssh create 2h --host example.com --port 2222
 hssh list
 hssh revoke hs_1234abcd
 hssh password off
 ```
 
-自定义时长格式为 `Nm`、`Nh` 或 `Nd`，范围 1 分钟至 30 天。有效期从创建账号时开始，不会因重连或改密延长。地址和端口仅用于打印连接信息，不会改动服务器监听设置或防火墙。
+自定义时长格式为 `Nm`、`Nh` 或 `Nd`，范围 1 分钟至 30 天。有效期从创建账号时开始，不会因重连或改密延长。自动地址取系统到公网的 IPv4 路由源地址，拒绝私网地址；NAT、代理或非标准 SSH 端口环境请在命令行使用 `--host` / `--port` 覆盖并从外部验证。地址和端口仅用于打印连接信息，不会改动服务器监听设置或防火墙。
 
 ## SSH 开关与到期回收
 
