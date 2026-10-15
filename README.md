@@ -4,8 +4,10 @@
 
 ## 一键安装 / 更新
 
+需 `curl`，以 root 或有 sudo 权限的账号运行：
+
 ```bash
-bash -c 'set -e; root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else command -v sudo >/dev/null || { printf "请先切换 root 用户\n" >&2; exit 1; }; sudo "$@"; fi; }; if ! command -v curl >/dev/null || [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then root apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update; root env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends curl ca-certificates; fi; f=$(mktemp); trap '\''rm -f -- "$f"'\'' EXIT; curl -fsSL --proto "=https" --tlsv1.2 --connect-timeout 15 --max-time 120 --retry 2 https://raw.githubusercontent.com/LYISTR2/temp-ssh-tool/main/bootstrap.sh -o "$f"; bash "$f"'
+curl -fsSLO https://raw.githubusercontent.com/LYISTR2/temp-ssh-tool/main/bootstrap.sh && bash bootstrap.sh
 ```
 
 ## 使用
