@@ -1,0 +1,10 @@
+ARG BASE=debian:13-slim
+FROM ${BASE}
+ENV container=docker
+# Only the init system is preinstalled. TempSSH must install its own dependencies.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends systemd systemd-sysv dbus \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /usr/sbin/policy-rc.d
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

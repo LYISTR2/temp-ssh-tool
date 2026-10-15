@@ -60,16 +60,54 @@ def password_policy(enabled):
 def password_enabled():
     return effective().get('passwordauthentication')=='yes'
 
+def public_ip(value,version):
+    if not isinstance(value,str) or '%' in value:return None
+    try:address=ipaddress.ip_address(value.strip())
+    except ValueError:return None
+    if address.version==version and address.is_global and not address.is_multicast:
+        return str(address)
+    return None
+
 def detect_public_ip():
-    """Use the kernel's outbound IPv4 route; never guess a NAT or proxy address."""
-    result=run('ip','-j','-4','route','get','1.1.1.1',capture_output=True).stdout
-    routes=json.loads(result)
-    if not routes or not (routes[0].get('prefsrc') or routes[0].get('src')):
-        raise RuntimeError('无法识别服务器出口 IP；请用 --host 指定实际可连接地址')
-    address=routes[0].get('prefsrc') or routes[0].get('src')
-    if not ipaddress.ip_address(address).is_global:
-        raise RuntimeError('出口 IP 不是公网地址（可能位于 NAT 后）；请用 --host 指定实际可连接地址')
-    return address
+    """Prefer a public route source, then query direct HTTPS; IPv4 before IPv6."""
+    sources=[
+        (4,'1.1.1.1',('https://api.ipify.org','https://ipv4.icanhazip.com')),
+        (6,'2606:4700:4700::1111',('https://api6.ipify.org','https://ipv6.icanhazip.com')),
+    ]
+    for version,target,urls in sources:
+        try:
+            result=run('ip','-j','-'+str(version),'route','get',target,
+                       capture_output=True,timeout=2).stdout
+            routes=json.loads(result)
+            for route in routes if isinstance(routes,list) else []:
+                if not isinstance(route,dict):continue
+                for field in ('prefsrc','src'):
+                    address=public_ip(route.get(field),version)
+                    if address:return address
+        except (OSError,ValueError,subprocess.SubprocessError):pass
+        for url in urls:
+            try:
+                # Ignore curlrc and proxies: their egress IP may belong to another host.
+                result=run('curl','-q','--fail','--silent','--show-error','-'+str(version),
+                           '--noproxy','*','--proto','=https','--connect-timeout','2',
+                           '--max-time','3','--max-filesize','64',url,
+                           capture_output=True,timeout=4).stdout
+                address=public_ip(result,version)
+                if address:
+                    print('提示：已查询公网出口 IP；NAT 入站地址或端口可能不同，必要时用 --host / --port 覆盖。',file=sys.stderr)
+                    return address
+            except (OSError,ValueError,subprocess.SubprocessError):pass
+    raise RuntimeError('无法自动识别公网 IPv4/IPv6（路由不可用或直连 HTTPS 查询失败）；请用 --host 指定实际可连接地址，NAT 映射端口用 --port 指定')
+
+def connection_host(host):
+    if host:return host
+    try:return detect_public_ip()
+    except RuntimeError as error:
+        if not sys.stdin.isatty():raise
+        print(str(error),file=sys.stderr)
+        host=input('请输入实际 SSH 地址（IP 或域名，留空取消）: ').strip()
+        if not host:raise ValueError('未指定连接地址，已取消创建账号')
+        return host
 
 def duration_seconds(value):
     match=re.fullmatch(r'([1-9][0-9]*)([mhd])',value)
@@ -169,7 +207,7 @@ def create(args):
     if not password_enabled():raise ValueError('服务器密码登录已关闭，请先在菜单开启')
     if args.role=='sudo' and not shutil.which('visudo'):
         raise RuntimeError('缺少 sudo/visudo，无法创建高权限账号')
-    host=args.host or detect_public_ip()
+    host=connection_host(args.host)
     seconds=duration_seconds(args.duration)
     # Record creation immediately after useradd; failure rolls back the new account.
     created=False
@@ -192,7 +230,8 @@ def create(args):
             else:run('userdel','--remove',name)
         raise
     print('\n临时 SSH 登录信息（密码只显示一次）')
-    print('地址：'+host+':'+str(args.port))
+    display_host='['+host+']' if ':' in host and not host.startswith('[') else host
+    print('地址：'+display_host+':'+str(args.port))
     print('账号：'+name)
     print('密码：'+password)
     print('到期：'+datetime.datetime.fromtimestamp(expires,datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'))
@@ -256,12 +295,14 @@ def main():
     if os.geteuid()!=0:raise PermissionError('请使用 sudo 或 root 运行')
     os.umask(0o077);BASE.mkdir(mode=0o700,parents=True,exist_ok=True)
     if not args.action:return menu(p)
+    if args.action=='create':
+        if not 1<=args.port<=65535:raise ValueError('端口范围 1–65535')
+        # Do not block expiry cleanup while probing the network or awaiting input.
+        args.host=connection_host(args.host)
     with open(BASE/'.lock','w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         if args.action=='install':install()
-        elif args.action=='create':
-            if not 1<=args.port<=65535:raise ValueError('端口范围 1–65535')
-            create(args)
+        elif args.action=='create':create(args)
         elif args.action=='revoke':revoke(args.name)
         elif args.action=='cleanup':cleanup()
         elif args.action=='password':password_policy(args.state=='on')
