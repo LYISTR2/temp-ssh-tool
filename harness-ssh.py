@@ -239,13 +239,14 @@ def create(args):
     print('提前撤销：hssh revoke '+name)
     print(('高权限用户，可使用 sudo（需输入该账号密码）。' if args.role=='sudo' else '普通用户，无 sudo。')+'请从另一终端验证新连接。')
 
-def list_accounts():
+def list_accounts(numbered=False):
     records=sorted(BASE.glob('hs_*.json'))
     if not records:print('暂无临时账号')
-    for record in records:
+    for index,record in enumerate(records,1):
         info=json.loads(record.read_text())
         expiry=datetime.datetime.fromtimestamp(info['expires'],datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        print(record.stem+'  '+('高权限 sudo' if info.get('role')=='sudo' else '普通用户')+'  到期 '+expiry+('  已到期，待清理' if info['expires']<=time.time() else ''))
+        print((str(index)+'. ' if numbered else '')+record.stem+'  '+('高权限 sudo' if info.get('role')=='sudo' else '普通用户')+'  到期 '+expiry+('  已到期，待清理' if info['expires']<=time.time() else ''))
+    return [record.stem for record in records]
 
 def parser():
     p=argparse.ArgumentParser(description=__doc__);s=p.add_subparsers(dest='action')
@@ -276,11 +277,13 @@ def menu(p):
                 target='off' if password_enabled() else 'on'
                 argv=['password',target]
             elif choice=='3':
-                subprocess.run([sys.executable,str(APP),'list'],check=True)
-                name=input('输入账号名立即断开连接并删除，回车返回: ').strip()
-                if not name:continue
-                valid_name(name)
-                argv=['revoke',name]
+                names=list_accounts(numbered=True)
+                if not names:continue
+                selection=input('输入编号立即断开连接并删除账号，0 或回车返回: ').strip()
+                if selection in ('','0'):continue
+                if not selection.isascii() or not selection.isdecimal() or not 1<=int(selection)<=len(names):
+                    raise ValueError('无效编号，请重新选择')
+                argv=['revoke',names[int(selection)-1]]
             else:raise ValueError('无效选项')
             # Run each operation separately: never hold the cleanup lock while waiting for input.
             subprocess.run([sys.executable,str(pathlib.Path(__file__).resolve()),*argv],check=True)

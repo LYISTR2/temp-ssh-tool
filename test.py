@@ -214,22 +214,59 @@ class Tests(unittest.TestCase):
                 run.assert_called_once()
                 self.assertEqual(run.call_args.args[0][-2:], ['password', target])
 
-    def test_menu_revoke_executes_without_confirmation(self):
-        with mock.patch.object(a, 'password_enabled', return_value=True), \
-                mock.patch('builtins.input', side_effect=['3', 'hs_abcdef', '0']) as ask, \
-                mock.patch.object(a.subprocess, 'run') as run:
+    def test_menu_revoke_uses_numbered_snapshot_without_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(a, 'BASE', pathlib.Path(directory)), \
+                mock.patch.object(a, 'password_enabled', return_value=True), \
+                mock.patch('builtins.input', side_effect=['3', '2', '0']) as ask, \
+                mock.patch.object(a.subprocess, 'run') as run, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            for name in ('hs_ghijkl', 'hs_abcdef'):
+                a.meta(name).write_text(json.dumps({'expires': time.time()+100}))
             a.menu(a.parser())
             self.assertEqual(ask.call_count, 3)
-            self.assertEqual([call.args[0][-2:] for call in run.call_args_list],
-                             [[str(a.APP), 'list'], ['revoke', 'hs_abcdef']])
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0][-2:], ['revoke', 'hs_ghijkl'])
+            self.assertIn('1. hs_abcdef', output.getvalue())
+            self.assertIn('2. hs_ghijkl', output.getvalue())
 
     def test_menu_account_list_and_return(self):
-        with mock.patch.object(a, 'password_enabled', return_value=False), \
-                mock.patch('builtins.input', side_effect=['3', '', '0']), \
+        for selection in ('', '0', '2', '-1', 'abc', '９'):
+            with self.subTest(selection=selection), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(a, 'BASE', pathlib.Path(directory)), \
+                    mock.patch.object(a, 'password_enabled', return_value=False), \
+                    mock.patch('builtins.input', side_effect=['3', selection, '0']), \
+                    mock.patch.object(a.subprocess, 'run') as run:
+                a.meta('hs_abcdef').write_text(json.dumps({'expires': time.time()+100}))
+                a.menu(a.parser())
+                run.assert_not_called()
+
+    def test_menu_number_does_not_shift_if_other_record_disappears(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(a, 'BASE', pathlib.Path(directory)), \
+                mock.patch.object(a, 'password_enabled', return_value=True), \
+                mock.patch.object(a.subprocess, 'run') as run:
+            for name in ('hs_abcdef', 'hs_ghijkl'):
+                a.meta(name).write_text(json.dumps({'expires': time.time()+100}))
+            def choose(prompt):
+                if prompt.startswith('输入编号'):
+                    a.meta('hs_abcdef').unlink()
+                    return '2'
+                return next(choices)
+            choices=iter(['3', '0'])
+            with mock.patch('builtins.input', side_effect=choose):
+                a.menu(a.parser())
+            self.assertEqual(run.call_args.args[0][-2:], ['revoke', 'hs_ghijkl'])
+
+    def test_menu_empty_account_list_returns_to_menu(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(a, 'BASE', pathlib.Path(directory)), \
+                mock.patch.object(a, 'password_enabled', return_value=False), \
+                mock.patch('builtins.input', side_effect=['3', '0']) as ask, \
                 mock.patch.object(a.subprocess, 'run') as run:
             a.menu(a.parser())
-            run.assert_called_once()
-            self.assertIn('list', run.call_args.args[0])
+            self.assertEqual(ask.call_count, 2)
+            run.assert_not_called()
 
     def test_existing_user_not_deleted(self):
         args = a.parser().parse_args(['create', '1h', '--name', 'hs_abcdef'])
