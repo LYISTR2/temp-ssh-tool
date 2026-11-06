@@ -262,27 +262,24 @@ def menu(p):
             choice=input('选择: ').strip()
             if choice=='0':return
             if choice=='1':
-                if not password_enabled():
-                    if input('密码登录已关闭，输入 yes 开启后继续: ').strip()!='yes':continue
-                    subprocess.run([sys.executable,str(APP),'password','on'],check=True)
                 duration=input('时长 1=1小时 2=2小时 3=3小时 4=自定义 [1]: ').strip() or '1'
                 if duration=='4':duration=input('输入时长（例如 90m / 4h / 2d）: ').strip()
                 else:duration={'1':'1h','2':'2h','3':'3h'}.get(duration,'')
                 duration_seconds(duration)
-                role=input('账号权限 1=普通用户（默认） 2=高权限 sudo: ').strip() or '1'
+                role=input('账号权限 1=普通用户（默认） 2=高权限 sudo（可管理整台服务器）: ').strip() or '1'
                 if role not in ('1','2'):raise ValueError('无效账号权限选项')
-                if role=='2' and input('高权限账号可通过 sudo 管理整台服务器，输入 yes 确认: ').strip()!='yes':continue
+                if not password_enabled():
+                    print('密码登录已关闭，正在开启服务器 SSH 密码登录。')
+                    subprocess.run([sys.executable,str(APP),'password','on'],check=True)
                 argv=['create',duration,'--role','sudo' if role=='2' else 'normal']
             elif choice=='2':
                 target='off' if password_enabled() else 'on'
-                if input('将'+('关闭' if target=='off' else '开启')+'服务器 SSH 密码登录，输入 yes 确认: ').strip()!='yes':continue
                 argv=['password',target]
             elif choice=='3':
                 subprocess.run([sys.executable,str(APP),'list'],check=True)
-                name=input('输入账号名提前撤销，回车返回: ').strip()
+                name=input('输入账号名立即断开连接并删除，回车返回: ').strip()
                 if not name:continue
                 valid_name(name)
-                if input('将断开连接并删除账号，输入 yes 确认: ').strip()!='yes':continue
                 argv=['revoke',name]
             else:raise ValueError('无效选项')
             # Run each operation separately: never hold the cleanup lock while waiting for input.
@@ -310,3 +307,4 @@ def main():
 if __name__=='__main__':
     try:main()
     except Exception as e:print('错误:',e,file=sys.stderr);sys.exit(1)
+
