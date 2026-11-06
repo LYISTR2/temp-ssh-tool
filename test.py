@@ -185,17 +185,43 @@ class Tests(unittest.TestCase):
             self.assertEqual(ask.call_count, 4)
             self.assertEqual(run.call_args.args[0][-4:], ['create', '1h', '--role', 'normal'])
 
-    def test_menu_sudo_requires_confirmation(self):
+    def test_menu_sudo_executes_without_confirmation(self):
         with mock.patch.object(a, 'password_enabled', return_value=True), \
-                mock.patch('builtins.input', side_effect=['1', '', '2', 'no', '0']), \
+                mock.patch('builtins.input', side_effect=['1', '', '2', '0']) as ask, \
                 mock.patch.object(a.subprocess, 'run') as run:
             a.menu(a.parser())
-            run.assert_not_called()
-        with mock.patch.object(a, 'password_enabled', return_value=True), \
-                mock.patch('builtins.input', side_effect=['1', '', '2', 'yes', '0']), \
-                mock.patch.object(a.subprocess, 'run') as run:
-            a.menu(a.parser())
+            self.assertEqual(ask.call_count, 4)
+            run.assert_called_once()
             self.assertEqual(run.call_args.args[0][-4:], ['create', '1h', '--role', 'sudo'])
+
+    def test_menu_create_enables_password_without_confirmation(self):
+        with mock.patch.object(a, 'password_enabled', return_value=False), \
+                mock.patch('builtins.input', side_effect=['1', '', '', '0']) as ask, \
+                mock.patch.object(a.subprocess, 'run') as run:
+            a.menu(a.parser())
+            self.assertEqual(ask.call_count, 4)
+            self.assertEqual([call.args[0][-2:] for call in run.call_args_list],
+                             [['password', 'on'], ['--role', 'normal']])
+
+    def test_menu_password_toggle_executes_without_confirmation(self):
+        for enabled, target in ((True, 'off'), (False, 'on')):
+            with self.subTest(enabled=enabled), \
+                    mock.patch.object(a, 'password_enabled', return_value=enabled), \
+                    mock.patch('builtins.input', side_effect=['2', '0']) as ask, \
+                    mock.patch.object(a.subprocess, 'run') as run:
+                a.menu(a.parser())
+                self.assertEqual(ask.call_count, 2)
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args[0][-2:], ['password', target])
+
+    def test_menu_revoke_executes_without_confirmation(self):
+        with mock.patch.object(a, 'password_enabled', return_value=True), \
+                mock.patch('builtins.input', side_effect=['3', 'hs_abcdef', '0']) as ask, \
+                mock.patch.object(a.subprocess, 'run') as run:
+            a.menu(a.parser())
+            self.assertEqual(ask.call_count, 3)
+            self.assertEqual([call.args[0][-2:] for call in run.call_args_list],
+                             [[str(a.APP), 'list'], ['revoke', 'hs_abcdef']])
 
     def test_menu_account_list_and_return(self):
         with mock.patch.object(a, 'password_enabled', return_value=False), \
@@ -476,3 +502,4 @@ class Tests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
